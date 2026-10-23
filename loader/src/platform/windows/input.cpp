@@ -415,6 +415,11 @@ static uint16_t getActualVKey(uint16_t vkey, uint16_t scanCode, uint16_t flags) 
 
 LRESULT CALLBACK GeodeRawInputWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     if (msg != WM_INPUT) {
+        // chaining to ourselves would recurse on every single message until the
+        // stack overflows, which is what happens when the hook is installed twice
+        if (!g_originalRawInputProc || g_originalRawInputProc == GeodeRawInputWndProc) {
+            return DefWindowProcW(hwnd, msg, wParam, lParam);
+        }
         return CallWindowProcW(g_originalRawInputProc, hwnd, msg, wParam, lParam);
     }
 
@@ -720,17 +725,35 @@ struct GeodeRawInput : Modify<GeodeRawInput, CCEGLView> {
     }
 
     static void attemptHookRawInput() {
-        g_rawInputHWND = FindWindowW(L"GD_RawInput", nullptr);
-        if (!g_rawInputHWND) {
+        auto hwnd = FindWindowW(L"GD_RawInput", nullptr);
+        if (!hwnd) {
             // in case it takes more than 1 frame, try getting the window again next frame
             queueInMainThread([]{ attemptHookRawInput(); });
             return;
         }
 
-        g_originalRawInputProc = reinterpret_cast<WNDPROC>(SetWindowLongPtrW(
+        // the game calls setupWindow again when the window is recreated (for example
+        // when switching between fullscreen and windowed mode), so this can run more
+        // than once for the same window
+        if (hwnd == g_rawInputHWND) {
+            auto current = reinterpret_cast<WNDPROC>(GetWindowLongPtrW(hwnd, GWLP_WNDPROC));
+            if (current == GeodeRawInputWndProc) {
+                return;
+            }
+        }
+
+        g_rawInputHWND = hwnd;
+        auto previous = reinterpret_cast<WNDPROC>(SetWindowLongPtrW(
             g_rawInputHWND, GWLP_WNDPROC,
             reinterpret_cast<LONG_PTR>(GeodeRawInputWndProc)
         ));
+
+        // SetWindowLongPtrW returns the proc that was previously installed; if the
+        // hook was already installed that is our own proc, and storing it would make
+        // every message recurse into GeodeRawInputWndProc forever
+        if (previous && previous != GeodeRawInputWndProc) {
+            g_originalRawInputProc = previous;
+        }
     }
 
     void setupWindow(CCRect rect) {
